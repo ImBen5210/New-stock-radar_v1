@@ -56,7 +56,11 @@ def get_sp500_tickers():
 
 def check_market(symbol):
     try:
-        data = yf.download(symbol, period="50d", progress=False)
+        # 修復：改用 Ticker.history 確保回傳乾淨的 DataFrame，避免 download() 的多層索引錯誤
+        data = yf.Ticker(symbol).history(period="50d")
+        if data.empty:
+            return True, 0, 0
+            
         close_series = data['Close']
         close = float(close_series.iloc[-1])
         ma20 = float(close_series.rolling(20).mean().iloc[-1])
@@ -170,9 +174,11 @@ def fetch_and_calculate_features(market_name):
 
     # 抓取大盤資訊
     try:
-        mkt_data = yf.download(market_ticker, period="1y", auto_adjust=True, progress=False)['Close']
+        # 修復：同上，使用 yf.Ticker() 避開 MultiIndex 造成的大盤 RS 失真
+        mkt_data = yf.Ticker(market_ticker).history(period="1y")['Close']
         mkt_ret_20 = float((mkt_data.iloc[-1] / mkt_data.iloc[-21]) - 1) * 100
-    except:
+    except Exception as e:
+        print(f"大盤RS計算失敗: {e}")
         mkt_ret_20 = 0.0
 
     all_tickers = list(stock_dict.keys())
@@ -185,8 +191,11 @@ def fetch_and_calculate_features(market_name):
             time.sleep(0.5) # 稍微喘息，避免被 yfinance 阻擋 IP
             data = yf.download(batch, period="1y", interval="1d", group_by='ticker', auto_adjust=True, progress=False, threads=True)
             for ticker in batch:
-                df = data[ticker] if len(batch) > 1 else data
-                process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records)
+                try:
+                    df = data[ticker] if len(batch) > 1 else data
+                    process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records)
+                except:
+                    continue
         except Exception as e:
             print(f"yfinance 抓取批次失敗: {e}")
             continue
