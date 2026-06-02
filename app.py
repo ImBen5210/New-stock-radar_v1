@@ -6,6 +6,7 @@ import requests
 from io import StringIO
 from datetime import datetime, timedelta
 import warnings
+import time
 
 warnings.filterwarnings('ignore')
 
@@ -59,31 +60,41 @@ def check_market(symbol):
         if data.empty:
             return True, 0, 0
             
-        close_series = data['Close']
-        close = float(close_series.iloc[-1])
-        ma20 = float(close_series.rolling(20).mean().iloc[-1])
+        # 使用 .values 避開 pandas indexing 的潛在 bug
+        close_vals = data['Close'].dropna().values
+        close = float(close_vals[-1])
+        ma20 = float(data['Close'].rolling(20).mean().dropna().values[-1])
         return close >= ma20, close, ma20
     except Exception as e:
         print(f"大盤檢查失敗: {e}")
         return True, 0, 0
 
-# 將計算邏輯獨立，統一由 yfinance 餵入資料
-def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records):
+# 🛡️ 計算邏輯防護升級：全面採用 Numpy 陣列取值，無視 yfinance 的結構變化
+def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records, debug_errors):
     try:
-        if df is None or df.empty or len(df) < 120: return 
-        df = df.dropna()
+        # 統一欄位名稱大小寫 (防範 yfinance 偶發性變成全小寫)
+        df.columns = [str(c).capitalize() for c in df.columns]
         
-        close = df['Close']
-        vol = df['Volume']
-        high = df['High']
-        low = df['Low']
-        open_p = df['Open']
+        required_cols = ['Close', 'Open', 'High', 'Low', 'Volume']
+        if not all(col in df.columns for col in required_cols):
+            return
+            
+        df = df.dropna(subset=required_cols)
+        if len(df) < 120: 
+            return 
+            
+        # 🚀 降維打擊：將價格資料轉為純數值陣列 (Numpy array) 取值，徹底杜絕 .iloc 崩潰
+        c_vals = df['Close'].values
+        o_vals = df['Open'].values
+        h_vals = df['High'].values
+        l_vals = df['Low'].values
+        v_vals = df['Volume'].values
         
-        # 🛡️ 防護升級：預防 yfinance 偶爾將單一數值包裝成 Series 的 Bug
-        c_close = float(close.iloc[-1].iloc[0]) if isinstance(close.iloc[-1], pd.Series) else float(close.iloc[-1])
-        c_open = float(open_p.iloc[-1].iloc[0]) if isinstance(open_p.iloc[-1], pd.Series) else float(open_p.iloc[-1])
-        c_high = float(high.iloc[-1].iloc[0]) if isinstance(high.iloc[-1], pd.Series) else float(high.iloc[-1])
-        c_low = float(low.iloc[-1].iloc[0]) if isinstance(low.iloc[-1], pd.Series) else float(low.iloc[-1])
+        c_close = float(c_vals[-1])
+        c_open = float(o_vals[-1])
+        c_high = float(h_vals[-1])
+        c_low = float(l_vals[-1])
+        c_vol = float(v_vals[-1])
         
         # 避雷針過濾
         k_len = c_high - c_low
@@ -92,52 +103,48 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
             if upper_shadow > 0.5: return 
                 
         # 爆量倍數
-        vol_20_mean = float(vol.tail(20).mean())
-        c_vol = float(vol.iloc[-1].iloc[0]) if isinstance(vol.iloc[-1], pd.Series) else float(vol.iloc[-1])
+        vol_20_mean = float(np.mean(v_vals[-20:]))
         vol_ratio = c_vol / (vol_20_mean + 1e-9)
 
         # 爆量黑K過濾
-        is_black_k = c_close < c_open
-        if vol_ratio > 2.5 and is_black_k: return 
+        if vol_ratio > 2.5 and c_close < c_open: return 
         
-        roll_5 = close.rolling(5)
-        roll_20 = close.rolling(20)
-        roll_60 = close.rolling(60)
-        
-        ma5 = float(roll_5.mean().iloc[-1])
+        # 均線計算 (依賴 Pandas rolling，但取值用 .values[-1])
+        c_series = df['Close']
+        ma5 = float(c_series.rolling(5).mean().dropna().values[-1])
         if c_close < ma5: return  # 必須站在 5MA 之上
         
         ma5_bias = ((c_close - ma5) / (ma5 + 1e-9)) * 100
-        ma20 = float(roll_20.mean().iloc[-1])
-        ma60 = float(roll_60.mean().iloc[-1])
+        ma20 = float(c_series.rolling(20).mean().dropna().values[-1])
+        ma60 = float(c_series.rolling(60).mean().dropna().values[-1])
         
-        # 流動性計算 (yfinance台股回傳的是股數，需要除以 1000 變為張)
+        # 流動性計算
+        avg_vol = float(np.mean(v_vals[-5:]))
         if "台股" in market_name:
-            avg_vol = float((vol.tail(5).mean()) / 1000)
-        else:
-            avg_vol = float(vol.tail(5).mean())
+            avg_vol = avg_vol / 1000.0
         
-        c_close_21 = float(close.iloc[-21].iloc[0]) if isinstance(close.iloc[-21], pd.Series) else float(close.iloc[-21])
-        stock_ret_20 = float((c_close / c_close_21 - 1) * 100)
+        c_close_21 = float(c_vals[-21])
+        stock_ret_20 = ((c_close / c_close_21) - 1) * 100
         rs_20 = stock_ret_20 - mkt_ret_20
         
-        past_120_max = float(close.iloc[-121:-1].max())
+        past_120_max = float(np.max(c_vals[-121:-1]))
         dist_120_high = float((c_close / past_120_max - 1) * 100) if past_120_max > 0 else 0
 
-        daily_ret = close.pct_change()
-        hist_vol = float(daily_ret.rolling(20).std().iloc[-1] * np.sqrt(252) * 100)
-        std20 = float(roll_20.std().iloc[-1])
-        bb_upper = float(ma20 + 2 * std20)
-        bb_width = float((bb_upper - (ma20 - 2 * std20)) / (ma20 + 1e-9) * 100)
+        daily_ret = c_series.pct_change().dropna()
+        std20_ret = daily_ret.rolling(20).std().dropna().values
+        if len(std20_ret) == 0: return
+        hist_vol = float(std20_ret[-1] * np.sqrt(252) * 100)
+        
+        std20_price = float(c_series.rolling(20).std().dropna().values[-1])
+        bb_upper = float(ma20 + 2 * std20_price)
+        bb_width = float((bb_upper - (ma20 - 2 * std20_price)) / (ma20 + 1e-9) * 100)
         
         trend_str = (ma5 / (ma60 + 1e-9) - 1) * 100
         p_to_ma20 = (c_close / (ma20 + 1e-9) - 1) * 100
         p_to_bbupper = (c_close / (bb_upper + 1e-9) - 1) * 100
         
-        c_close_11 = float(close.iloc[-11].iloc[0]) if isinstance(close.iloc[-11], pd.Series) else float(close.iloc[-11])
+        c_close_11 = float(c_vals[-11])
         roc_10 = float((c_close - c_close_11) / (c_close_11 + 1e-9) * 100)
-        
-        if np.isnan(hist_vol) or np.isnan(roc_10): return
 
         records.append({
             'ID': ticker.replace(".TW", "").replace(".TWO", ""),
@@ -156,11 +163,12 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
             'F_P_to_MA20': p_to_ma20, 'F_P_to_BBUpper': p_to_bbupper, 'F_ROC_10': roc_10
         })
     except Exception as e:
-        pass 
+        debug_errors.append(f"標的 {ticker} 計算錯誤: {str(e)}") 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_and_calculate_features(market_name):
     records = []
+    debug_errors = [] # 收集錯誤原因
     
     if "台股" in market_name:
         stock_dict = get_tw_stock_list()
@@ -172,7 +180,7 @@ def fetch_and_calculate_features(market_name):
         market_ticker = "^GSPC"
 
     if not stock_dict:
-        return pd.DataFrame(), vol_label
+        return pd.DataFrame(), vol_label, ["❌ 獲取股票母體清單失敗"]
 
     try:
         mkt_data = yf.Ticker(market_ticker).history(period="1y")['Close']
@@ -186,29 +194,34 @@ def fetch_and_calculate_features(market_name):
     for i in range(0, len(all_tickers), batch_size):
         batch = all_tickers[i:i+batch_size]
         try:
+            time.sleep(0.5) 
             data = yf.download(batch, period="1y", interval="1d", group_by='ticker', auto_adjust=True, progress=False, threads=True)
-            if data.empty: continue
+            
+            if data is None or data.empty: 
+                debug_errors.append(f"批次 {i} 獲取失敗: yfinance 回傳空值 (可能暫時遭封鎖 IP)")
+                continue
             
             for ticker in batch:
                 try:
                     df = None
-                    # 🛡️ 結構防護罩：無懼 yfinance 各版本的 MultiIndex 結構變化
                     if isinstance(data.columns, pd.MultiIndex):
-                        if ticker in data.columns.get_level_values(0):
-                            df = data[ticker]
-                        elif ticker in data.columns.get_level_values(1):
+                        if ticker in data.columns.get_level_values(1):
                             df = data.xs(ticker, level=1, axis=1)
+                        elif ticker in data.columns.get_level_values(0):
+                            df = data[ticker]
                     else:
-                        df = data
-                        
-                    process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records)
-                except Exception:
-                    continue
+                        if len(batch) == 1: df = data
+                            
+                    if df is not None and not df.empty:
+                        process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records, debug_errors)
+                except Exception as e:
+                    debug_errors.append(f"{ticker} 抽取失敗: {str(e)}")
+                    
         except Exception as e:
-            print(f"yfinance 抓取批次失敗: {e}")
+            debug_errors.append(f"批次 {i} 請求異常: {str(e)}")
             continue
                 
-    return pd.DataFrame(records), vol_label
+    return pd.DataFrame(records), vol_label, debug_errors
 
 # ==========================================
 # 網頁介面設計
@@ -238,11 +251,16 @@ if st.button("開始全面掃描", type="primary"):
         st.error(f"🔴 【大盤偏空】目前指數 ({idx_close:.2f}) 跌破月線 ({idx_ma:.2f})，極易假突破，建議空手觀望！")
 
     with st.status(f"🔍 啟動 {market} 運算中 (包含 RS 大盤比對，約需 1-2 分鐘)...", expanded=True) as status:
-        df_all, vol_label = fetch_and_calculate_features(market)
+        df_all, vol_label, debug_errors = fetch_and_calculate_features(market)
         
+        # 🚨 加入錯誤追蹤機制
         if df_all.empty:
             status.update(label="❌ 掃描失敗或無符合標的", state="error", expanded=False)
-            st.error("目前無法取得數據，請確認網路連線或稍後再試。")
+            error_msg = "目前無法取得有效數據，可能是 `yfinance` 暫時阻擋了 IP 或資料結構異常。\n\n"
+            if debug_errors:
+                error_msg += "**系統除錯日誌 (前 5 筆)：**\n"
+                for err in debug_errors[:5]: error_msg += f"- {err}\n"
+            st.error(error_msg)
             st.stop()
             
         df_records = df_all[df_all['Avg_Vol'] >= user_vol_limit].copy()
@@ -269,7 +287,6 @@ if st.button("開始全面掃描", type="primary"):
         status.update(label="✅ 掃描與運算完成！", state="complete", expanded=False)
 
     display_cols = ['ID', '股名', '板塊產業', '收盤價', 'MA5 (防守線)', '5MA乖離率(%)', '爆量倍數', 'RS相對強度', '120日高距離(%)', vol_label, 'AI 總分']
-    # 確保兼容所有 Streamlit 版本
     st.dataframe(top20[display_cols], use_container_width=True, hide_index=True)
     
     st.info(f"💡 **乖離率實戰指南**：🟢 0% - 3% 首選試單 ｜ 🟡 3% - {user_bias_limit}% 注意追高｜ 🔴 >{user_bias_limit}% 已自動扣分處罰。")
