@@ -6,7 +6,6 @@ import requests
 from io import StringIO
 from datetime import datetime, timedelta
 import warnings
-import time
 
 warnings.filterwarnings('ignore')
 
@@ -56,7 +55,6 @@ def get_sp500_tickers():
 
 def check_market(symbol):
     try:
-        # 修復：改用 Ticker.history 確保回傳乾淨的 DataFrame，避免 download() 的多層索引錯誤
         data = yf.Ticker(symbol).history(period="50d")
         if data.empty:
             return True, 0, 0
@@ -72,7 +70,7 @@ def check_market(symbol):
 # 將計算邏輯獨立，統一由 yfinance 餵入資料
 def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records):
     try:
-        if df.empty or len(df) < 120: return 
+        if df is None or df.empty or len(df) < 120: return 
         df = df.dropna()
         
         close = df['Close']
@@ -81,10 +79,11 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
         low = df['Low']
         open_p = df['Open']
         
-        c_close = float(close.iloc[-1])
-        c_open = float(open_p.iloc[-1])
-        c_high = float(high.iloc[-1])
-        c_low = float(low.iloc[-1])
+        # 🛡️ 防護升級：預防 yfinance 偶爾將單一數值包裝成 Series 的 Bug
+        c_close = float(close.iloc[-1].iloc[0]) if isinstance(close.iloc[-1], pd.Series) else float(close.iloc[-1])
+        c_open = float(open_p.iloc[-1].iloc[0]) if isinstance(open_p.iloc[-1], pd.Series) else float(open_p.iloc[-1])
+        c_high = float(high.iloc[-1].iloc[0]) if isinstance(high.iloc[-1], pd.Series) else float(high.iloc[-1])
+        c_low = float(low.iloc[-1].iloc[0]) if isinstance(low.iloc[-1], pd.Series) else float(low.iloc[-1])
         
         # 避雷針過濾
         k_len = c_high - c_low
@@ -94,7 +93,8 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
                 
         # 爆量倍數
         vol_20_mean = float(vol.tail(20).mean())
-        vol_ratio = float(vol.iloc[-1]) / (vol_20_mean + 1e-9)
+        c_vol = float(vol.iloc[-1].iloc[0]) if isinstance(vol.iloc[-1], pd.Series) else float(vol.iloc[-1])
+        vol_ratio = c_vol / (vol_20_mean + 1e-9)
 
         # 爆量黑K過濾
         is_black_k = c_close < c_open
@@ -117,7 +117,8 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
         else:
             avg_vol = float(vol.tail(5).mean())
         
-        stock_ret_20 = float((c_close / float(close.iloc[-21]) - 1) * 100)
+        c_close_21 = float(close.iloc[-21].iloc[0]) if isinstance(close.iloc[-21], pd.Series) else float(close.iloc[-21])
+        stock_ret_20 = float((c_close / c_close_21 - 1) * 100)
         rs_20 = stock_ret_20 - mkt_ret_20
         
         past_120_max = float(close.iloc[-121:-1].max())
@@ -132,7 +133,9 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
         trend_str = (ma5 / (ma60 + 1e-9) - 1) * 100
         p_to_ma20 = (c_close / (ma20 + 1e-9) - 1) * 100
         p_to_bbupper = (c_close / (bb_upper + 1e-9) - 1) * 100
-        roc_10 = float((c_close - close.iloc[-11]) / (close.iloc[-11] + 1e-9) * 100)
+        
+        c_close_11 = float(close.iloc[-11].iloc[0]) if isinstance(close.iloc[-11], pd.Series) else float(close.iloc[-11])
+        roc_10 = float((c_close - c_close_11) / (c_close_11 + 1e-9) * 100)
         
         if np.isnan(hist_vol) or np.isnan(roc_10): return
 
@@ -153,13 +156,12 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
             'F_P_to_MA20': p_to_ma20, 'F_P_to_BBUpper': p_to_bbupper, 'F_ROC_10': roc_10
         })
     except Exception as e:
-        pass # 遇到計算錯誤靜默略過，不干擾主畫面
+        pass 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_and_calculate_features(market_name):
     records = []
     
-    # 決定抓取母體清單
     if "台股" in market_name:
         stock_dict = get_tw_stock_list()
         vol_label = "5日均量(張)"
@@ -172,29 +174,35 @@ def fetch_and_calculate_features(market_name):
     if not stock_dict:
         return pd.DataFrame(), vol_label
 
-    # 抓取大盤資訊
     try:
-        # 修復：同上，使用 yf.Ticker() 避開 MultiIndex 造成的大盤 RS 失真
         mkt_data = yf.Ticker(market_ticker).history(period="1y")['Close']
         mkt_ret_20 = float((mkt_data.iloc[-1] / mkt_data.iloc[-21]) - 1) * 100
-    except Exception as e:
-        print(f"大盤RS計算失敗: {e}")
+    except Exception:
         mkt_ret_20 = 0.0
 
     all_tickers = list(stock_dict.keys())
     batch_size = 50
     
-    # 全面採用 yfinance 引擎批次抓取
     for i in range(0, len(all_tickers), batch_size):
         batch = all_tickers[i:i+batch_size]
         try:
-            time.sleep(0.5) # 稍微喘息，避免被 yfinance 阻擋 IP
             data = yf.download(batch, period="1y", interval="1d", group_by='ticker', auto_adjust=True, progress=False, threads=True)
+            if data.empty: continue
+            
             for ticker in batch:
                 try:
-                    df = data[ticker] if len(batch) > 1 else data
+                    df = None
+                    # 🛡️ 結構防護罩：無懼 yfinance 各版本的 MultiIndex 結構變化
+                    if isinstance(data.columns, pd.MultiIndex):
+                        if ticker in data.columns.get_level_values(0):
+                            df = data[ticker]
+                        elif ticker in data.columns.get_level_values(1):
+                            df = data.xs(ticker, level=1, axis=1)
+                    else:
+                        df = data
+                        
                     process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records)
-                except:
+                except Exception:
                     continue
         except Exception as e:
             print(f"yfinance 抓取批次失敗: {e}")
@@ -261,7 +269,8 @@ if st.button("開始全面掃描", type="primary"):
         status.update(label="✅ 掃描與運算完成！", state="complete", expanded=False)
 
     display_cols = ['ID', '股名', '板塊產業', '收盤價', 'MA5 (防守線)', '5MA乖離率(%)', '爆量倍數', 'RS相對強度', '120日高距離(%)', vol_label, 'AI 總分']
-    st.dataframe(top20[display_cols], width="stretch", hide_index=True)
+    # 確保兼容所有 Streamlit 版本
+    st.dataframe(top20[display_cols], use_container_width=True, hide_index=True)
     
     st.info(f"💡 **乖離率實戰指南**：🟢 0% - 3% 首選試單 ｜ 🟡 3% - {user_bias_limit}% 注意追高｜ 🔴 >{user_bias_limit}% 已自動扣分處罰。")
     
@@ -272,7 +281,7 @@ if st.button("開始全面掃描", type="primary"):
     
     col1, col2 = st.columns([1, 2])
     with col1:
-        st.dataframe(sector_counts, hide_index=True, width="stretch")
+        st.dataframe(sector_counts, hide_index=True, use_container_width=True)
     with col2:
         st.bar_chart(sector_counts.set_index('板塊產業'))
 
