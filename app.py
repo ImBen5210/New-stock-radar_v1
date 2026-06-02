@@ -19,11 +19,17 @@ st.set_page_config(page_title="AI動能妖股雷達 (全市場降載版)", page_
 @st.cache_data(ttl=3600)
 def get_tw_stock_list():
     stock_dict = {}
+    err_msg = ""
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        # 🛡️ 升級：完整的真實瀏覽器偽裝，避免被證交所阻擋
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        }
         for m in [2, 4]:
             url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={m}"
             res = requests.get(url, headers=headers, verify=False, timeout=15)
+            res.raise_for_status() # 檢查是否遭遇 403 阻擋
             df = pd.read_html(StringIO(res.text))[0].iloc[1:]
             for _, row in df.iterrows():
                 try:
@@ -37,22 +43,28 @@ def get_tw_stock_list():
                 except Exception: 
                     continue
     except Exception as e: 
-        print(f"獲取台股清單發生錯誤: {e}")
-    return stock_dict
+        err_msg = f"台股清單抓取失敗: {str(e)}"
+    return stock_dict, err_msg
 
 @st.cache_data(ttl=86400)
 def get_sp500_tickers():
+    stock_dict = {}
+    err_msg = ""
     try:
         url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0'}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        }
         res = requests.get(url, headers=headers, timeout=15)
+        res.raise_for_status()
         df = pd.read_html(StringIO(res.text))[0]
         tickers = df['Symbol'].str.replace('.', '-').tolist()
         names = df['Security'].tolist()
         sectors = df['GICS Sector'].tolist()
-        return {t: {"name": n, "sector": s} for t, n, s in zip(tickers, names, sectors)}
-    except Exception: 
-        return {}
+        stock_dict = {t: {"name": n, "sector": s} for t, n, s in zip(tickers, names, sectors)}
+    except Exception as e: 
+        err_msg = f"美股清單抓取失敗: {str(e)}"
+    return stock_dict, err_msg
 
 def check_market(symbol):
     try:
@@ -60,7 +72,6 @@ def check_market(symbol):
         if data.empty:
             return True, 0, 0
             
-        # 使用 .values 避開 pandas indexing 的潛在 bug
         close_vals = data['Close'].dropna().values
         close = float(close_vals[-1])
         ma20 = float(data['Close'].rolling(20).mean().dropna().values[-1])
@@ -69,10 +80,8 @@ def check_market(symbol):
         print(f"大盤檢查失敗: {e}")
         return True, 0, 0
 
-# 🛡️ 計算邏輯防護升級：全面採用 Numpy 陣列取值，無視 yfinance 的結構變化
 def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, records, debug_errors):
     try:
-        # 統一欄位名稱大小寫 (防範 yfinance 偶發性變成全小寫)
         df.columns = [str(c).capitalize() for c in df.columns]
         
         required_cols = ['Close', 'Open', 'High', 'Low', 'Volume']
@@ -83,7 +92,6 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
         if len(df) < 120: 
             return 
             
-        # 🚀 降維打擊：將價格資料轉為純數值陣列 (Numpy array) 取值，徹底杜絕 .iloc 崩潰
         c_vals = df['Close'].values
         o_vals = df['Open'].values
         h_vals = df['High'].values
@@ -109,16 +117,14 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
         # 爆量黑K過濾
         if vol_ratio > 2.5 and c_close < c_open: return 
         
-        # 均線計算 (依賴 Pandas rolling，但取值用 .values[-1])
         c_series = df['Close']
         ma5 = float(c_series.rolling(5).mean().dropna().values[-1])
-        if c_close < ma5: return  # 必須站在 5MA 之上
+        if c_close < ma5: return 
         
         ma5_bias = ((c_close - ma5) / (ma5 + 1e-9)) * 100
         ma20 = float(c_series.rolling(20).mean().dropna().values[-1])
         ma60 = float(c_series.rolling(60).mean().dropna().values[-1])
         
-        # 流動性計算
         avg_vol = float(np.mean(v_vals[-5:]))
         if "台股" in market_name:
             avg_vol = avg_vol / 1000.0
@@ -168,19 +174,20 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_and_calculate_features(market_name):
     records = []
-    debug_errors = [] # 收集錯誤原因
+    debug_errors = [] 
     
     if "台股" in market_name:
-        stock_dict = get_tw_stock_list()
+        stock_dict, list_err = get_tw_stock_list()
         vol_label = "5日均量(張)"
         market_ticker = "^TWII"
     else:
-        stock_dict = get_sp500_tickers()
+        stock_dict, list_err = get_sp500_tickers()
         vol_label = "5日均量(M)"
         market_ticker = "^GSPC"
 
+    # 🛡️ 如果名單抓取失敗，將具體錯誤原因傳遞給前端
     if not stock_dict:
-        return pd.DataFrame(), vol_label, ["❌ 獲取股票母體清單失敗"]
+        return pd.DataFrame(), vol_label, [f"❌ 獲取股票母體清單失敗 ({list_err})"]
 
     try:
         mkt_data = yf.Ticker(market_ticker).history(period="1y")['Close']
@@ -198,7 +205,6 @@ def fetch_and_calculate_features(market_name):
             data = yf.download(batch, period="1y", interval="1d", group_by='ticker', auto_adjust=True, progress=False, threads=True)
             
             if data is None or data.empty: 
-                debug_errors.append(f"批次 {i} 獲取失敗: yfinance 回傳空值 (可能暫時遭封鎖 IP)")
                 continue
             
             for ticker in batch:
@@ -253,7 +259,6 @@ if st.button("開始全面掃描", type="primary"):
     with st.status(f"🔍 啟動 {market} 運算中 (包含 RS 大盤比對，約需 1-2 分鐘)...", expanded=True) as status:
         df_all, vol_label, debug_errors = fetch_and_calculate_features(market)
         
-        # 🚨 加入錯誤追蹤機制
         if df_all.empty:
             status.update(label="❌ 掃描失敗或無符合標的", state="error", expanded=False)
             error_msg = "目前無法取得有效數據，可能是 `yfinance` 暫時阻擋了 IP 或資料結構異常。\n\n"
