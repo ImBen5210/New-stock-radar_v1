@@ -21,7 +21,6 @@ def get_tw_stock_list():
     stock_dict = {}
     err_msg = ""
     try:
-        # 🛡️ 升級：完整的真實瀏覽器偽裝，避免被證交所阻擋
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
@@ -29,7 +28,7 @@ def get_tw_stock_list():
         for m in [2, 4]:
             url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={m}"
             res = requests.get(url, headers=headers, verify=False, timeout=15)
-            res.raise_for_status() # 檢查是否遭遇 403 阻擋
+            res.raise_for_status() 
             df = pd.read_html(StringIO(res.text))[0].iloc[1:]
             for _, row in df.iterrows():
                 try:
@@ -104,6 +103,10 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
         c_low = float(l_vals[-1])
         c_vol = float(v_vals[-1])
         
+        # 🔥 新增：計算今日與昨日漲跌幅 (加入保護避免除以 0)
+        today_ret = ((c_vals[-1] / c_vals[-2]) - 1) * 100 if c_vals[-2] > 0 else 0
+        yest_ret = ((c_vals[-2] / c_vals[-3]) - 1) * 100 if c_vals[-3] > 0 else 0
+        
         # 避雷針過濾
         k_len = c_high - c_low
         if k_len > 0:
@@ -157,6 +160,8 @@ def process_stock(ticker, df, stock_dict, market_name, vol_label, mkt_ret_20, re
             '股名': stock_dict[ticker]['name'],
             '板塊產業': stock_dict[ticker]['sector'],
             '收盤價': round(c_close, 2),
+            '今日漲幅(%)': round(today_ret, 2), # 🔥 新增欄位
+            '昨日漲幅(%)': round(yest_ret, 2), # 🔥 新增欄位
             'MA5 (防守線)': round(ma5, 2),
             '5MA乖離率(%)': round(ma5_bias, 2),
             '爆量倍數': round(vol_ratio, 2),
@@ -185,7 +190,6 @@ def fetch_and_calculate_features(market_name):
         vol_label = "5日均量(M)"
         market_ticker = "^GSPC"
 
-    # 🛡️ 如果名單抓取失敗，將具體錯誤原因傳遞給前端
     if not stock_dict:
         return pd.DataFrame(), vol_label, [f"❌ 獲取股票母體清單失敗 ({list_err})"]
 
@@ -291,7 +295,8 @@ if st.button("開始全面掃描", type="primary"):
         
         status.update(label="✅ 掃描與運算完成！", state="complete", expanded=False)
 
-    display_cols = ['ID', '股名', '板塊產業', '收盤價', 'MA5 (防守線)', '5MA乖離率(%)', '爆量倍數', 'RS相對強度', '120日高距離(%)', vol_label, 'AI 總分']
+    # 🔥 新增：將今日與昨日漲幅加入顯示清單中
+    display_cols = ['ID', '股名', '板塊產業', '收盤價', '今日漲幅(%)', '昨日漲幅(%)', 'MA5 (防守線)', '5MA乖離率(%)', '爆量倍數', 'RS相對強度', '120日高距離(%)', vol_label, 'AI 總分']
     st.dataframe(top20[display_cols], use_container_width=True, hide_index=True)
     
     st.info(f"💡 **乖離率實戰指南**：🟢 0% - 3% 首選試單 ｜ 🟡 3% - {user_bias_limit}% 注意追高｜ 🔴 >{user_bias_limit}% 已自動扣分處罰。")
